@@ -385,20 +385,35 @@ def do_install():
     if not src.exists() or str(src) == "-":
         print(c("✗ Cannot detect script path. Download manually.", RE)); sys.exit(1)
 
-    # 1. Copy binary
+    # 1. Copy binary (robust same-file check)
     INSTALL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if src != INSTALL_PATH.resolve():
-        shutil.copy2(src, INSTALL_PATH)
-    os.chmod(INSTALL_PATH, 0o755)
-    print(c(f"✓ Installed to {INSTALL_PATH}", GR))
 
-    # 2. Create config
+    copy_needed = True
+    try:
+        # os.path.samefile is the correct way to check "same file on disk"
+        if os.path.samefile(str(src), str(INSTALL_PATH)):
+            copy_needed = False
+    except OSError:
+        # target doesn't exist yet (first install) → we must copy
+        copy_needed = True
+
+    if copy_needed:
+        shutil.copy2(src, INSTALL_PATH)
+        print(c(f"✓ Installed/updated to {INSTALL_PATH}", GR))
+    else:
+        print(c(f"✓ Already installed at {INSTALL_PATH} (up-to-date)", GR))
+
+    os.chmod(INSTALL_PATH, 0o755)
+
+    # 2. Create config (only if missing)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         Config().save()
-    print(c(f"✓ Config created at {CONFIG_FILE}", GR))
+        print(c(f"✓ Config created at {CONFIG_FILE}", GR))
+    else:
+        print(c(f"✓ Config already exists at {CONFIG_FILE}", GR))
 
-    # 3. Systemd service
+    # 3. Systemd service (always rewrite so it stays current)
     svc_path = Path("/etc/systemd/system/mizonam.service")
     svc_path.write_text(SYSTEMD_UNIT.format(bin=INSTALL_PATH))
     run("systemctl daemon-reload")
@@ -408,7 +423,6 @@ def do_install():
 
     print()
     print(c(f"  Run:  mizonam menu", CY + B))
-
 
 # ══════════════════════════════════════════════════════════════
 #  TUI MENU
