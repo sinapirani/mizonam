@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 mizonam — Asymmetric Upload Balancer for Iranian servers
-Version  : 1.0.0
+Version  : 1.0.1-debug
 Requires : Python 3.6+  (pre-installed on Ubuntu 18.04+)
 Deps     : ZERO  (stdlib only)
 """
@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 # ══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════
-VERSION      = "1.0.0"
+VERSION      = "1.0.1-debug"
 CONFIG_DIR   = Path("/etc/mizonam")
 CONFIG_FILE  = CONFIG_DIR / "config.json"
 STATE_FILE   = CONFIG_DIR / "state.json"
@@ -49,10 +49,11 @@ TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 DEFAULT_CONFIG = {
     "enabled"     : True,
     "interface"   : "auto",
-    "coefficient" : 3,      # upload = download × coefficient (target)
-    "threads"     : 5,      # base thread count (scaled by time-of-day)
-    "buffer_kb"   : 64,     # UDP payload size per send
+    "coefficient" : 3,
+    "threads"     : 5,
+    "buffer_kb"   : 64,
     "custom_cidrs": [],
+    "debug"       : False,      # ← NEW: shows real destination IPs + errors
 }
 
 SYSTEMD_UNIT = """\
@@ -238,14 +239,20 @@ class IPGenerator:
 
 
 # ══════════════════════════════════════════════════════════════
-#  UDP UPLOADER  (threaded fire-and-forget sender)
+#  UDP UPLOADER  (threaded fire-and-forget sender + DEBUG)
 # ══════════════════════════════════════════════════════════════
 class UDPUploader:
-    def __init__(self, ip_gen, buffer_kb=64):
+    def __init__(self, ip_gen, buffer_kb=64, debug=False):
         self._ip_gen  = ip_gen
         self._payload = os.urandom(buffer_kb * 1024)
         self._sent    = 0
         self._lock    = threading.Lock()
+
+        # === DEBUG MODE ===
+        self._debug       = debug
+        self._sample_lock = threading.Lock()
+        self._sample_ips  = []
+        self._error_count = 0
 
     @property
     def sent(self):
@@ -253,6 +260,9 @@ class UDPUploader:
 
     def reset(self):
         with self._lock: self._sent = 0
+        with self._sample_lock:
+            self._sample_ips.clear()
+            self._error_count = 0
 
     def _worker(self, quota, stop):
         sent = 0
@@ -260,14 +270,24 @@ class UDPUploader:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.settimeout(0.3)
             while sent < quota and not stop.is_set():
+                dst_ip   = self._ip_gen.random_ip()
+                dst_port = self._ip_gen.random_port()
                 try:
-                    sock.sendto(self._payload, (self._ip_gen.random_ip(),
-                                                self._ip_gen.random_port()))
+                    sock.sendto(self._payload, (dst_ip, dst_port))
                     n = len(self._payload)
                     sent += n
                     with self._lock: self._sent += n
-                except Exception:
-                    pass
+
+                    # Sample successful sends for debug (very light, ~1 every 200 packets)
+                    if self._debug and random.random() < 0.005:
+                        with self._sample_lock:
+                            if len(self._sample_ips) < 20:
+                                self._sample_ips.append(f"{dst_ip}:{dst_port}")
+                except Exception as e:
+                    with self._sample_lock:
+                        self._error_count += 1
+                    if self._debug and random.random() < 0.05:   # log errors sparingly
+                        log(f"UDP send error to {dst_ip}:{dst_port} → {type(e).__name__}: {str(e)[:100]}", "WARN")
         finally:
             try: sock.close()
             except Exception: pass
@@ -330,7 +350,7 @@ def run_daemon():
     cfg     = Config()
     monitor = NetworkMonitor(cfg.get("interface"))
     ip_gen  = IPGenerator(IRANIAN_CIDRS + cfg.get("custom_cidrs"))
-    uploader= UDPUploader(ip_gen, cfg.get("buffer_kb"))
+    uploader= UDPUploader(ip_gen, cfg.get("buffer_kb"), debug=cfg.get("debug", False))
 
     log(f"Mizonam v{VERSION} daemon started | iface={monitor.interface}")
 
@@ -344,7 +364,7 @@ def run_daemon():
         # Rebuild IP generator if custom CIDRs changed
         all_cidrs = IRANIAN_CIDRS + (cfg.get("custom_cidrs") or [])
         ip_gen    = IPGenerator(all_cidrs)
-        uploader  = UDPUploader(ip_gen, cfg.get("buffer_kb"))
+        uploader  = UDPUploader(ip_gen, cfg.get("buffer_kb"), debug=cfg.get("debug", False))
 
         upload, download = monitor.get_counters()
         coeff = float(cfg.get("coefficient")) * random.uniform(0.7, 1.3)
@@ -371,11 +391,26 @@ def run_daemon():
             time.sleep(random.randint(5, 30))
 
         log(f"Cycle done | sent={fmt_bytes(uploader.sent)}")
+
+        # === DEBUG: show which IPs were targeted and any errors ===
+        if getattr(uploader, '_debug', False):
+            with uploader._sample_lock:
+                samples = list(uploader._sample_ips)[:8]
+                errors  = uploader._error_count
+            if samples or errors > 0:
+                sample_str = ", ".join(samples) + (" ..." if len(samples) == 8 else "")
+                level = "WARN" if errors > 0 else "INFO"
+                log(f"DEBUG → Samples: {sample_str or 'none'} | Errors: {errors}", level)
+            # always clear for next cycle
+            with uploader._sample_lock:
+                uploader._sample_ips.clear()
+                uploader._error_count = 0
+
         time.sleep(random.randint(10, 30))
 
 
 # ══════════════════════════════════════════════════════════════
-#  INSTALLER
+#  INSTALLER (fixed - no more SameFileError)
 # ══════════════════════════════════════════════════════════════
 def do_install():
     if os.geteuid() != 0:
@@ -424,6 +459,7 @@ def do_install():
     print()
     print(c(f"  Run:  mizonam menu", CY + B))
 
+
 # ══════════════════════════════════════════════════════════════
 #  TUI MENU
 # ══════════════════════════════════════════════════════════════
@@ -455,6 +491,7 @@ def menu():
         iface     = monitor.interface
         hour_mul  = HOUR_MUL[tehran_hour()]
         eff_thr   = int(cfg.get("threads") * hour_mul)
+        debug_on  = cfg.get("debug", False)
 
         print(c("  ┌─ Live Stats ──────────────────────────────┐", D))
         print(f"  │  Service   : {c('● RUNNING', GR+B) if status=='running' else c('● STOPPED', RE+B):<30}  │")
@@ -465,6 +502,7 @@ def menu():
         print(f"  │  Ratio     : {bar_str}  {c(f'{ratio:.2f}x',MA)} / {target_r}x  │")
         print(f"  │  Gap       : {c(fmt_bytes(gap), RE if gap>1e9 else GR):<38}│")
         print(f"  │  Eff.Thrs  : {c(eff_thr, CY)} (Tehran hour {tehran_hour():02d}:xx) {'':<12}│")
+        print(f"  │  Debug mode: {c('ENABLED' if debug_on else 'DISABLED', GR+B if debug_on else D):<38}│")
         print(c("  └───────────────────────────────────────────┘", D))
         print()
 
@@ -476,6 +514,7 @@ def menu():
         print(f"  {c('[4]',CY+B)} Buffer size ............... [{c(str(cfg.get('buffer_kb'))+' KB', YE)}]")
         print(f"  {c('[5]',CY+B)} Network interface ......... [{c(cfg.get('interface'), YE)}]")
         print(f"  {c('[6]',CY+B)} Add custom CIDR ........... [{c(len(cfg.get('custom_cidrs')), YE)} added]")
+        print(f"  {c('[7]',CY+B)} Toggle debug mode ......... [{c('ON ' if cfg.get('debug',False) else 'OFF', GR+B if cfg.get('debug',False) else RE+B)}]")
         print()
         print(f"  {c('[r]',CY+B)} Restart service")
         print(f"  {c('[l]',CY+B)} View last 30 log lines")
@@ -543,6 +582,14 @@ def menu():
                         print(c("  ✓ Removed.", GR))
                     except (ValueError, IndexError):
                         pass
+            time.sleep(1)
+
+        elif choice == "7":
+            debug_now = cfg.get("debug", False)
+            cfg.set("debug", not debug_now)
+            status = "ENABLED" if not debug_now else "DISABLED"
+            color  = GR if not debug_now else YE
+            print(c(f"  ✓ Debug mode {status}", color))
             time.sleep(1)
 
         elif choice == "r":
