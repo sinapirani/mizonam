@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 mizonam — Asymmetric Upload Balancer for Iranian servers
-Version  : 1.0.1-debug
+Version  : 1.0.2-customonly
 Requires : Python 3.6+  (pre-installed on Ubuntu 18.04+)
 Deps     : ZERO  (stdlib only)
 """
@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 # ══════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ══════════════════════════════════════════════════════════════
-VERSION      = "1.0.1-debug"
+VERSION      = "1.0.2-customonly"
 CONFIG_DIR   = Path("/etc/mizonam")
 CONFIG_FILE  = CONFIG_DIR / "config.json"
 STATE_FILE   = CONFIG_DIR / "state.json"
@@ -47,13 +47,14 @@ HOUR_MUL = [
 TEHRAN_TZ = timezone(timedelta(hours=3, minutes=30))
 
 DEFAULT_CONFIG = {
-    "enabled"     : True,
-    "interface"   : "auto",
-    "coefficient" : 3,
-    "threads"     : 5,
-    "buffer_kb"   : 64,
-    "custom_cidrs": [],
-    "debug"       : False,      # ← NEW: shows real destination IPs + errors
+    "enabled"      : True,
+    "interface"    : "auto",
+    "coefficient"  : 3,
+    "threads"      : 5,
+    "buffer_kb"    : 64,
+    "custom_cidrs" : [],
+    "debug"        : False,
+    "custom_only"  : False,     # ← NEW: when True → send ONLY to custom CIDRs
 }
 
 SYSTEMD_UNIT = """\
@@ -349,10 +350,19 @@ def run_daemon():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     cfg     = Config()
     monitor = NetworkMonitor(cfg.get("interface"))
-    ip_gen  = IPGenerator(IRANIAN_CIDRS + cfg.get("custom_cidrs"))
-    uploader= UDPUploader(ip_gen, cfg.get("buffer_kb"), debug=cfg.get("debug", False))
 
-    log(f"Mizonam v{VERSION} daemon started | iface={monitor.interface}")
+    # Initial IP generator (respect custom_only)
+    custom_cidrs = cfg.get("custom_cidrs") or []
+    custom_only  = cfg.get("custom_only", False)
+    if custom_only and custom_cidrs:
+        all_cidrs = custom_cidrs
+        log("Custom-Only mode: using ONLY custom CIDRs", "INFO")
+    else:
+        all_cidrs = IRANIAN_CIDRS + custom_cidrs
+    ip_gen    = IPGenerator(all_cidrs)
+    uploader  = UDPUploader(ip_gen, cfg.get("buffer_kb"), debug=cfg.get("debug", False))
+
+    log(f"Mizonam v{VERSION} daemon started | iface={monitor.interface} | custom_only={custom_only}")
 
     while True:
         cfg.load()  # hot reload
@@ -361,8 +371,19 @@ def run_daemon():
             time.sleep(30)
             continue
 
-        # Rebuild IP generator if custom CIDRs changed
-        all_cidrs = IRANIAN_CIDRS + (cfg.get("custom_cidrs") or [])
+        # Rebuild IP generator with new Custom-Only logic
+        custom_cidrs = cfg.get("custom_cidrs") or []
+        custom_only  = cfg.get("custom_only", False)
+
+        if custom_only and custom_cidrs:
+            all_cidrs = custom_cidrs
+            log("Custom-Only mode: using ONLY custom CIDRs", "INFO")
+        elif custom_only and not custom_cidrs:
+            all_cidrs = IRANIAN_CIDRS
+            log("Custom-Only mode enabled but no custom CIDRs → falling back to Iranian ranges", "WARN")
+        else:
+            all_cidrs = IRANIAN_CIDRS + custom_cidrs
+
         ip_gen    = IPGenerator(all_cidrs)
         uploader  = UDPUploader(ip_gen, cfg.get("buffer_kb"), debug=cfg.get("debug", False))
 
@@ -425,11 +446,9 @@ def do_install():
 
     copy_needed = True
     try:
-        # os.path.samefile is the correct way to check "same file on disk"
         if os.path.samefile(str(src), str(INSTALL_PATH)):
             copy_needed = False
     except OSError:
-        # target doesn't exist yet (first install) → we must copy
         copy_needed = True
 
     if copy_needed:
@@ -448,7 +467,7 @@ def do_install():
     else:
         print(c(f"✓ Config already exists at {CONFIG_FILE}", GR))
 
-    # 3. Systemd service (always rewrite so it stays current)
+    # 3. Systemd service
     svc_path = Path("/etc/systemd/system/mizonam.service")
     svc_path.write_text(SYSTEMD_UNIT.format(bin=INSTALL_PATH))
     run("systemctl daemon-reload")
@@ -483,15 +502,27 @@ def menu():
         print()
 
         # ── Live stats ────────────────────────────────────────
-        up, dl    = monitor.get_counters()
-        ratio     = up / dl if dl > 0 else 0
-        target_r  = float(cfg.get("coefficient"))
-        gap       = max(0, dl * target_r - up)
-        status    = svc_status()
-        iface     = monitor.interface
-        hour_mul  = HOUR_MUL[tehran_hour()]
-        eff_thr   = int(cfg.get("threads") * hour_mul)
-        debug_on  = cfg.get("debug", False)
+        up, dl       = monitor.get_counters()
+        ratio        = up / dl if dl > 0 else 0
+        target_r     = float(cfg.get("coefficient"))
+        gap          = max(0, dl * target_r - up)
+        status       = svc_status()
+        iface        = monitor.interface
+        hour_mul     = HOUR_MUL[tehran_hour()]
+        eff_thr      = int(cfg.get("threads") * hour_mul)
+        debug_on     = cfg.get("debug", False)
+        custom_only  = cfg.get("custom_only", False)
+        custom_count = len(cfg.get("custom_cidrs") or [])
+
+        if custom_only and custom_count > 0:
+            mode_str = "CUSTOM ONLY"
+            mode_col = CY
+        elif custom_only:
+            mode_str = "CUSTOM ONLY (fallback)"
+            mode_col = YE
+        else:
+            mode_str = "IRANIAN + CUSTOM"
+            mode_col = YE
 
         print(c("  ┌─ Live Stats ──────────────────────────────┐", D))
         print(f"  │  Service   : {c('● RUNNING', GR+B) if status=='running' else c('● STOPPED', RE+B):<30}  │")
@@ -503,6 +534,7 @@ def menu():
         print(f"  │  Gap       : {c(fmt_bytes(gap), RE if gap>1e9 else GR):<38}│")
         print(f"  │  Eff.Thrs  : {c(eff_thr, CY)} (Tehran hour {tehran_hour():02d}:xx) {'':<12}│")
         print(f"  │  Debug mode: {c('ENABLED' if debug_on else 'DISABLED', GR+B if debug_on else D):<38}│")
+        print(f"  │  IP Mode   : {c(mode_str, mode_col):<38}│")
         print(c("  └───────────────────────────────────────────┘", D))
         print()
 
@@ -513,8 +545,9 @@ def menu():
         print(f"  {c('[3]',CY+B)} Base threads .............. [{c(cfg.get('threads'), YE)}]")
         print(f"  {c('[4]',CY+B)} Buffer size ............... [{c(str(cfg.get('buffer_kb'))+' KB', YE)}]")
         print(f"  {c('[5]',CY+B)} Network interface ......... [{c(cfg.get('interface'), YE)}]")
-        print(f"  {c('[6]',CY+B)} Add custom CIDR ........... [{c(len(cfg.get('custom_cidrs')), YE)} added]")
+        print(f"  {c('[6]',CY+B)} Add custom CIDR ........... [{c(custom_count, YE)} added]")
         print(f"  {c('[7]',CY+B)} Toggle debug mode ......... [{c('ON ' if cfg.get('debug',False) else 'OFF', GR+B if cfg.get('debug',False) else RE+B)}]")
+        print(f"  {c('[8]',CY+B)} Toggle Custom CIDR-Only ... [{c('ON ' if custom_only else 'OFF', GR+B if custom_only else RE+B)}]")
         print()
         print(f"  {c('[r]',CY+B)} Restart service")
         print(f"  {c('[l]',CY+B)} View last 30 log lines")
@@ -590,6 +623,14 @@ def menu():
             status = "ENABLED" if not debug_now else "DISABLED"
             color  = GR if not debug_now else YE
             print(c(f"  ✓ Debug mode {status}", color))
+            time.sleep(1)
+
+        elif choice == "8":
+            now = cfg.get("custom_only", False)
+            cfg.set("custom_only", not now)
+            status = "ENABLED" if not now else "DISABLED"
+            color  = GR if not now else YE
+            print(c(f"  ✓ Custom CIDR-Only mode {status}", color))
             time.sleep(1)
 
         elif choice == "r":
