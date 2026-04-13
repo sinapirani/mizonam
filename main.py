@@ -387,7 +387,8 @@ def do_install():
 
     # 1. Copy binary
     INSTALL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, INSTALL_PATH)
+    if src != INSTALL_PATH.resolve():
+        shutil.copy2(src, INSTALL_PATH)
     os.chmod(INSTALL_PATH, 0o755)
     print(c(f"✓ Installed to {INSTALL_PATH}", GR))
 
