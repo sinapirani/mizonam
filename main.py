@@ -463,9 +463,7 @@ def do_install():
     svc_path.write_text(SYSTEMD_UNIT.format(bin=INSTALL_PATH))
     run("systemctl daemon-reload")
     run("systemctl enable mizonam")
-    # FIX 1: از restart به جای start استفاده می‌کنیم
-    # تا در صورتی که سرویس قبلاً در حال اجرا بوده، مطمئن بشیم با کد جدید ری‌استارت می‌شه
-    ok, _ = run("systemctl restart mizonam")
+    ok, _ = run("systemctl start mizonam")
     print(c("✓ Service enabled & started", GR) if ok else c("⚠ Service start failed", YE))
 
     print()
@@ -549,32 +547,21 @@ def menu():
             run("systemctl restart mizonam")
         elif choice == "2":
             v = input(c("  Coefficient (e.g. 3): ", D)).strip()
-            try:
-                cfg.set("coefficient", max(0.5, min(20.0, float(v))))
-                # FIX 2: بعد از هر تغییر config، سرویس رو ری‌استارت می‌کنیم
-                run("systemctl restart mizonam")
+            try: cfg.set("coefficient", max(0.5, min(20.0, float(v))))
             except: pass
         elif choice == "3":
             v = input(c("  Base threads [1-100]: ", D)).strip()
-            try:
-                cfg.set("threads", max(1, min(100, int(v))))
-                # FIX 2
-                run("systemctl restart mizonam")
+            try: cfg.set("threads", max(1, min(100, int(v))))
             except: pass
         elif choice == "4":
             v = input(c("  Buffer KB [1-64]: ", D)).strip()
-            try:
-                cfg.set("buffer_kb", max(1, min(64, int(v))))
-                # FIX 2
-                run("systemctl restart mizonam")
+            try: cfg.set("buffer_kb", max(1, min(64, int(v))))
             except: pass
         elif choice == "5":
             v = input(c("  Interface: ", D)).strip()
             if v:
                 cfg.set("interface", v)
                 monitor.interface = monitor._detect(v)
-                # FIX 2
-                run("systemctl restart mizonam")
         elif choice == "6":
             v = input(c("  CIDR to add or blank to list/remove: ", D)).strip()
             if v:
@@ -582,8 +569,6 @@ def menu():
                 if v not in cidrs:
                     cidrs.append(v)
                     cfg.set("custom_cidrs", cidrs)
-                    # FIX 2
-                    run("systemctl restart mizonam")
                     print(c(f"  ✓ Added {v}", GR))
                 else:
                     print(c("  Already in list.", YE))
@@ -598,23 +583,17 @@ def menu():
                     try:
                         cidrs.pop(int(rm))
                         cfg.set("custom_cidrs", cidrs)
-                        # FIX 2
-                        run("systemctl restart mizonam")
                         print(c("  ✓ Removed.", GR))
                     except: pass
             time.sleep(1)
         elif choice == "7":
             debug_now = cfg.get("debug", True)
             cfg.set("debug", not debug_now)
-            # FIX 2
-            run("systemctl restart mizonam")
             print(c(f"  ✓ Debug mode {'ENABLED' if not debug_now else 'DISABLED'}", GR if not debug_now else YE))
             time.sleep(1)
         elif choice == "8":
             now = cfg.get("custom_only", False)
             cfg.set("custom_only", not now)
-            # FIX 2
-            run("systemctl restart mizonam")
             print(c(f"  ✓ Custom CIDR-Only mode {'ENABLED' if not now else 'DISABLED'}", GR if not now else YE))
             time.sleep(1)
         elif choice == "r":
